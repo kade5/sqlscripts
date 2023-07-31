@@ -3,16 +3,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"sync"
 
-	// "errors"
-	"fmt"
-
 	_ "github.com/microsoft/go-mssqldb"
-
-	"os"
 )
 
 var db *sql.DB
@@ -33,65 +31,38 @@ func main() {
 	}
 	fmt.Printf("Connected!\n")
 
-	count, err := readSPScripts()
+	count, err := buildScripts("PROCEDURE")
 	if err != nil {
-		log.Fatal("Error with sql scripts: ", err.Error())
+		log.Fatal("Error with sp sql scripts: ", err.Error())
 	}
-	fmt.Printf("Read %d row(s) successfully.\n", count)
+	fmt.Printf("Succesfully wrote %d stored procedures to file(s)\n", count)
+
+	fun_count, err := buildScripts("FUNCTION")
+	if err != nil {
+		log.Fatal("Error with function sql scripts: ", err.Error())
+	}
+	fmt.Printf("Succesfully wrote %d functions to file(s)\n", fun_count)
+
+	view_count, err := buildScripts("VIEW")
+	if err != nil {
+		log.Fatal("Error with view sql scripts: ", err.Error())
+	}
+	fmt.Printf("Succesfully wrote %d views to file(s)\n", view_count)
 }
 
-func ReadProp() (int, error) {
-	ctx := context.Background()
-
-	err := db.PingContext(ctx)
-	if err != nil {
-		return -1, err
+func buildScripts(objectName string) (int, error) {
+	var filepath string
+	switch objectName {
+	case "PROCEDURE":
+		filepath = "sp_scripts/"
+	case "FUNCTION":
+		filepath = "function_scripts/"
+	case "VIEW":
+		filepath = "view_scripts/"
+	default:
+		return -1, errors.New("Invalid object name")
 	}
-
-	tsql := fmt.Sprintf(`
-		SELECT
-			TOP 1
-			SCHEMA_NAME(o.schema_id) AS [Schema],
-			o.name,
-			o.object_id,
-			sm.definition
-		FROM
-			sys.objects o
-		inner join sys.sql_modules sm on
-			o.object_id = sm.object_id
-		WHERE
-			o.type = 'P';
-		`)
-
-	rows, err := db.QueryContext(ctx, tsql)
-	if err != nil {
-		return -1, err
-	}
-
-	defer rows.Close()
-
-	var count int
-
-	for rows.Next() {
-		var definition, schema, name string
-		var id int
-
-		err := rows.Scan(&schema, &name, &id, &definition)
-		if err != nil {
-			return -1, err
-		}
-
-		definition = replaceCreateWithCreateOrAlter(definition)
-
-		fmt.Printf("ID: %d Name: %s.%s\nDefinition: \n%s\n", id, schema, name, definition)
-		count++
-	}
-
-	return count, nil
-}
-
-func readSPScripts() (int, error) {
-	filepath := "data/sp_scripts/"
+	
 	ctx := context.Background()
 
 	err := db.PingContext(ctx)
@@ -100,20 +71,9 @@ func readSPScripts() (int, error) {
 		return -1, err
 	}
 
-	rows, err := db.Query(`
-		SELECT
-			SCHEMA_NAME(o.schema_id) AS [Schema],
-			o.name,
-			sm.definition
-		FROM
-			sys.objects o
-		inner join sys.sql_modules sm on
-			o.object_id = sm.object_id
-		WHERE
-			o.type = 'P';
-		`)
+	rows, err := db.Query(getQuery(objectName))
 	if err != nil {
-		log.Fatalf("Failed to execute query")
+		log.Fatalf("Failed to execute query: %v", err)
 		return -1, err
 	}
 
@@ -121,6 +81,8 @@ func readSPScripts() (int, error) {
 
 	done := make(chan bool)
 	var wg sync.WaitGroup
+
+	count := 0
 
 	for rows.Next() {
 		var schema, name, definition string
@@ -132,7 +94,7 @@ func readSPScripts() (int, error) {
 
 		wg.Add(1)
 
-		go func(schema, name, definition, filepath string) {
+		go func(schema, name, definition, filepath, objectName string) {
 			defer wg.Done()
 			var filename string
 			if schema == "dbo" {
@@ -148,14 +110,15 @@ func readSPScripts() (int, error) {
 			}
 			defer file.Close()
 
-			_, err = file.WriteString(replaceCreateWithCreateOrAlter(definition))
+			_, err = file.WriteString(replaceCreateWithCreateOrAlter(definition, objectName))
 			if err != nil {
 				log.Fatalf("Failed to write to file")
 				return
 			}
 
 			log.Printf("File %s created successfully", filename)
-		}(schema, name, definition, filepath)
+		}(schema, name, definition, filepath, objectName)
+		count++
 	}
 
 	go func() {
@@ -169,13 +132,61 @@ func readSPScripts() (int, error) {
 		return -1, err
 	}
 
-	return 0, nil
+	return count, nil
 }
-func replaceCreateWithCreateOrAlter(definition string) string {
-	regexPattern := `(?i)CREATE\s+PROCEDURE`
+
+func getQuery(objectName string) string {
+	switch objectName {
+	case "PROCEDURE":
+		return `
+		SELECT
+			SCHEMA_NAME(o.schema_id) AS [Schema],
+			o.name,
+			sm.definition
+		FROM
+			sys.objects o
+		inner join sys.sql_modules sm on
+			o.object_id = sm.object_id
+		WHERE
+			o.type in ('P');
+		`
+	case "FUNCTION":
+		return `
+		SELECT
+			SCHEMA_NAME(o.schema_id) AS [Schema],
+			o.name,
+			sm.definition
+		FROM
+			sys.objects o
+		inner join sys.sql_modules sm on
+			o.object_id = sm.object_id
+		WHERE
+			o.type in ('FN', 'FS', 'FT', 'IF');
+
+		`
+	case "VIEW":
+		return `
+		SELECT
+			SCHEMA_NAME(o.schema_id) AS [Schema],
+			o.name,
+			sm.definition
+		FROM
+			sys.objects o
+		inner join sys.sql_modules sm on
+			o.object_id = sm.object_id
+		WHERE
+			o.type in ('V');
+		`
+	default:
+		return ""
+	}
+}
+
+func replaceCreateWithCreateOrAlter(definition, objectName string) string {
+	regexPattern := fmt.Sprintf(`(?i)CREATE\s+%s`, objectName)
 	re := regexp.MustCompile(regexPattern)
 
-	modifiedDefinition := re.ReplaceAllString(definition, "CREATE OR ALTER PROCEDURE")
+	modifiedDefinition := re.ReplaceAllString(definition, fmt.Sprintf("CREATE OR ALTER %s", objectName))
 
 	return modifiedDefinition
 }

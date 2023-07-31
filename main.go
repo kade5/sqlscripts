@@ -16,9 +16,13 @@ import (
 var db *sql.DB
 
 func main() {
-	connString := os.Args[1]
-	fmt.Println(connString)
+	var connString string
 	var err error
+	if len(os.Args) > 1 {
+		connString = os.Args[1]
+	} else {
+		log.Fatal("", errors.New("Connection String not provided in arguments"))
+	}
 	db, err = sql.Open("sqlserver", connString)
 
 	if err != nil {
@@ -62,7 +66,7 @@ func buildScripts(objectName string) (int, error) {
 	default:
 		return -1, errors.New("Invalid object name")
 	}
-	
+
 	ctx := context.Background()
 
 	err := db.PingContext(ctx)
